@@ -22,7 +22,7 @@ class TrivialHomomorphism(Homomorphism):
         return y
 
 class GroupBasis(nn.Module):
-    def __init__(self, input_dim, transformer, homomorphism, num_basis, standard_basis, loss_type='rmse', lr=5e-4, reg_fac=0.05, invar_fac=3, coeff_epsilon=1e-1, dtype=torch.float32):
+    def __init__(self, input_dim, transformer, homomorphism, num_basis, standard_basis, loss_type='rmse', lr=5e-4, reg_fac=0.05, invar_fac=1, coeff_epsilon=1e-1, dtype=torch.float32):
         super().__init__()
 
         self.input_dim = input_dim
@@ -74,12 +74,12 @@ class GroupBasis(nn.Module):
                 return torch.sum(torch.abs(x * xp / denom))
         else:
             if self.dtype == torch.complex64:
-                return torch.abs(torch.sum((
+                return torch.sum(torch.abs(torch.sum((
                     torch.real(x) * torch.real(xp) + 
                     torch.imag(x) * torch.imag(xp)
-                ) / denom))
+                ) / denom, dim=(-2, -1))))
             else:
-                return torch.abs(torch.sum(x * xp / denom))
+                return torch.sum(torch.abs(torch.sum(x * xp / denom, dim=(-2, -1))))
 
 
     def sample_coefficients(self, bs):
@@ -91,7 +91,7 @@ class GroupBasis(nn.Module):
         num_key_points = self.transformer.num_key_points()
         return torch.normal(0, self.coeff_epsilon, (bs, num_key_points, self.num_basis)).to(device) 
 
-    def apply(self, x, y):
+    def apply(self, x, predictor, y):
         """
             x is a batched tensor with dimension [bs, *manifold_dims, \sum input_dims]
             For instance, if the manifold is 2d and each vector on the feature field is 3d
@@ -101,14 +101,15 @@ class GroupBasis(nn.Module):
 
         coeffs = self.sample_coefficients(bs)
         
-        norm = self.normalize_basis(self.lie_basis) 
+        norm = self.normalize_basis(self.lie_basis)
         sampled = torch.sum(norm * coeffs.unsqueeze(-1).unsqueeze(-1), dim=-3)
 
         full_lie = self.transformer.smooth_function(sampled)
         full_exp = torch.matrix_exp(full_lie)
+        inv_exp = torch.matrix_exp(-full_lie)
         ret = (full_exp @ x.unsqueeze(-1)).squeeze(-1)
-
-        return ret, self.homomorphism.apply_y(full_exp, y)
+        
+        return self.homomorphism.apply_y(inv_exp, predictor.run(ret))
 
     def loss(self, xx, yy):
         if self.loss_type == 'rmse':

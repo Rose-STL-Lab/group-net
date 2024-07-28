@@ -52,8 +52,8 @@ class S1FFTransformer(FFTransformer):
     def __init__(self, u_dim, u_keypoints):
         assert u_dim % u_keypoints == 0
 
-        blend_key = torch.zeros((u_dim, 2), dtype=torch.int).to(device)
-        blend_val = torch.zeros((u_dim, 2)).to(device)
+        blend_key = torch.zeros((u_dim, 2), dtype=torch.int, device=device)
+        blend_val = torch.zeros((u_dim, 2), device=device)
 
         for u in range(u_dim):
             u0 = u * u_keypoints // u_dim

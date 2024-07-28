@@ -56,18 +56,16 @@ class LocalTrainer:
                     p_loss.backward()
                     self.predictor.optimizer.step()
 
-                torch.save(self.predictor, f"models/toptagclass_{e}.pt")
             p_losses = np.mean(p_losses) if len(p_losses) else 0
                 
             # train basis
             b_losses = []
             b_reg = []
             for xx, yy in tqdm.tqdm(loader):
-                xp, yp = self.basis.apply(xx, yy)
-                model_prediction = self.predictor.run(xp)
+                yp = self.basis.apply(xx, self.predictor, yy)
 
-                b_loss = self.basis.loss(model_prediction, yp) 
-                b_losses.append(float(b_loss.detach().cpu()))
+                b_loss = self.basis.loss(yp, yy) 
+                b_losses.append(float(b_loss))
 
                 reg = self.basis.regularization(e)
                 b_loss += reg
