@@ -1,11 +1,15 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pandas as pd
 import numpy as np
+import tqdm
+import math
 from PIL import Image
 import torchvision
 import matplotlib.pyplot as plt
 
+from itertools import permutations
 from utils import get_device, rmse 
 from local_symmetry import Predictor, LocalTrainer
 from group_basis import GroupBasis
@@ -14,10 +18,16 @@ from config import Config
 
 device = get_device(no_mps=False)
 
-lerp = TorusFFTransformer(450, 480, 10, 10) 
+_lerp = None
+def lerp():
+    global _lerp
+    if _lerp is None:
+        _lerp = TorusFFTransformer(450, 480, 2, 2)  
+    return _lerp
+
 def perform_flow(features, flow, steps=1, delta=1):
     # features: [bs, channels, r, c]
-    inverse = -flow * delta / steps
+    inverse = flow * delta / steps
     r = features.shape[2]
     c = features.shape[3]
 
@@ -47,65 +57,134 @@ def perform_flow(features, flow, steps=1, delta=1):
             clipped_y = tensor[..., 1].clip(0, c - 1).long()
             return curr[..., clipped_x, clipped_y] * mul
        
-        return factor(base_00, s * t) + factor(base_01, s * (1 - t)) + factor(base_10, (1 - s) * t) + factor(base_11, (1 - s) * (1 - t))
+        return factor(base_00, 1)
+        # return factor(base_00, s * t) + factor(base_01, s * (1 - t)) + factor(base_10, (1 - s) * t) + factor(base_11, (1 - s) * (1 - t))
 
     for _ in range(steps):
         features = step(features)
     return features
 
 class Flow(nn.Module):
-    def __init__(self, input_features, num_flows, output_features):
+    def __init__(self, input_features, num_flows, output_features, bad=False):
         super().__init__()
+
+        self.bad = bad
+
         self.input_features = input_features
         self.num_flows = num_flows
         self.output_features = output_features
 
-        self.main_flow = nn.Parameter(torch.empty(num_flows, 100, 2))
-        torch.nn.init.normal_(self.main_flow, 0, 0.02)
-        self.combinator = nn.Parameter(torch.empty(output_features, input_features * num_flows))
-        torch.nn.init.normal_(self.combinator, 0, 0.02)
+        # self.main_flow = nn.Parameter(torch.empty(num_flows, 100, 2))
+        # torch.nn.init.normal_(self.main_flow, 0, 0.02)
+        self.main_flow = torch.tensor([
+              [[-1, -1]],
+              [[-1, 0]],
+              [[-1, 1]],
+
+              [[0, -1]],
+              [[0, 0]],
+              [[0, 1]],
+ 
+              [[1, -1]],
+              [[1, 0]],
+              [[1, 1]],
+        ], device=device).expand((num_flows, 4, 2))
+
+        self.combinator = nn.Parameter(torch.empty(output_features, input_features * num_flows, device=device))
+        self.bias = nn.Parameter(torch.empty(output_features, device=device))
+
+        # same as conv initialization
+        n = input_features * num_flows
+        stdv = 1. / math.sqrt(n)
+        torch.nn.init.kaiming_uniform_(self.combinator, a=math.sqrt(5))
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.combinator)
+        if fan_in != 0:
+            bound = 1 / math.sqrt(fan_in)
+            torch.nn.init.uniform_(self.bias, -bound, bound)
+
+        self.c = nn.Conv2d(self.input_features, self.output_features, 3, padding=1)
+        self.c.weight = nn.Parameter(self.combinator.view(self.output_features, self.input_features, 3, 3))
+        self.c.bias = self.bias
          
     def forward(self, x):
-        flow = lerp.smooth_function(self.main_flow)
-        ret = torch.empty((self.num_flows, x.shape[0], self.input_features, 450, 480)).to(device)
+        flow = lerp().smooth_function(self.main_flow)
+        # ret = perform_flow(x, flow)
+
+        # Instead of using torch.roll, let's create a padded version of x
+        x_padded = F.pad(x, (1, 1, 1, 1), mode='constant', value=0) 
+
+        ret = torch.empty((self.num_flows, x.shape[0], self.input_features, 450, 480)).to(x.device)
         for i in range(self.num_flows):
+            # dy, dx = self.main_flow[i][0]
+            # ret[i] = x_padded[:, :, 1+dy:451+dy, 1+dx:481+dx]
             ret[i] = perform_flow(x, flow[i])
 
-        ret = ret.swapaxes(0, 1).reshape(x.shape[0], self.input_features * self.num_flows, 450, 480)
-        ret = ret.permute(0, 2, 3, 1).reshape(x.shape[0], 450, 480, self.input_features * self.num_flows, 1)
-        ret = self.combinator @ ret
-        return ret.squeeze(-1).permute(0, 3, 1, 2)
+        ret = ret.permute(1, 3, 4, 0, 2).reshape(x.shape[0], 450, 480, self.input_features * self.num_flows, 1)
+        ret = (self.combinator @ ret).squeeze(-1) + self.bias
+        ret = ret.permute(0, 3, 1, 2)
+        comp = self.c(x)
+        print(rmse(ret, comp))
+        return ret
+
+        if self.training and not self.bad:
+            comp = self.c(x)
+            return comp
+        else:
+            flow = lerp().smooth_function(self.main_flow)
+
+            x_padded = F.pad(x, (1, 1, 1, 1), mode='constant', value=0) 
+
+            ret = perform_flow(x, flow)
+            """
+            ret = torch.empty((self.num_flows, x.shape[0], self.input_features, 450, 480)).to(x.device)
+            for i in range(self.num_flows):
+                dy, dx = self.main_flow[i][0]
+                ret[i] = 
+                ret[i] = x_padded[:, :, 1+dy:451+dy, 1+dx:481+dx]
+            """
+
+            ret = ret.permute(1, 3, 4, 0, 2).reshape(x.shape[0], 450, 480, self.input_features * self.num_flows, 1)
+            ret = (self.combinator @ ret).squeeze(-1) + self.bias
+            ret = ret.permute(0, 3, 1, 2)
+
+            return ret
     
 class CloudPredictor(nn.Module):
     def __init__(self):
         super().__init__()
 
+        i = 6
+        f = 9
         self.model = nn.Sequential(
-            Flow(3, 4, 3),
+            Flow(3, f, i),
+            nn.BatchNorm2d(i),
+            nn.ReLU(),
+            Flow(i, f, i),
+            nn.BatchNorm2d(i),
+            nn.ReLU(),
+            Flow(i, f, 3),
             nn.BatchNorm2d(3),
             nn.ReLU(),
-            Flow(3, 4, 3),
-            nn.BatchNorm2d(3),
-            nn.ReLU(),
-            Flow(3, 4, 3),
-            nn.BatchNorm2d(3),
-            nn.ReLU(),
-            Flow(3, 4, 3),
+            Flow(3, f, 3),
             nn.Sigmoid(),
         )
+
+        """
+        k = 3
         self.model = nn.Sequential(
-            nn.Conv2d(3, 3, 3, padding='same'),
+            nn.Conv2d(3, i, k, padding='same'),
+            nn.BatchNorm2d(i),
+            nn.ReLU(),
+            nn.Conv2d(i, i, k, padding='same'),
+            nn.BatchNorm2d(i),
+            nn.ReLU(),
+            nn.Conv2d(i, 3, k, padding='same'),
             nn.BatchNorm2d(3),
             nn.ReLU(),
-            nn.Conv2d(3, 3, 3, padding='same'),
-            nn.BatchNorm2d(3),
-            nn.ReLU(),
-            nn.Conv2d(3, 3, 3, padding='same'),
-            nn.BatchNorm2d(3),
-            nn.ReLU(),
-            nn.Conv2d(3, 3, 3, padding='same'),
+            nn.Conv2d(3, 3, k, padding='same'),
             nn.Sigmoid(),
         )
+        """
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
     
     def forward(self, x):
@@ -138,10 +217,6 @@ class CloudDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         global flow
-        org_idx = idx
-        if self.l + idx <= 0:
-            idx = 1 - (self.l + idx) - self.l
-
         img_path = self.image_paths[idx]
         annotation_path = self.annotation_paths[idx]
 
@@ -156,56 +231,6 @@ class CloudDataset(torch.utils.data.Dataset):
         annotation_int[0] = (annotation==0).float()
         annotation_int[1] = (annotation==100).float()
         annotation_int[2] = (annotation==255).float()
-
-        if False and self.l + org_idx <= 0:
-            org_image = image
-
-            image = image.unsqueeze(0)
-            annotation_int = flow.unsqueeze(0)
-
-            image = perform_flow(image, flow)
-            annotation_int = perform_flow(image, flow)
-
-            image = image.squeeze(0)
-            annotation_int = annotation_int.squeeze(0)
-
-            """
-            def tensor_to_image(tensor):
-                # Convert tensor to numpy array
-                np_array = tensor.cpu().numpy()
-                
-                # Normalize the numpy array
-                np_array = (np_array - np_array.min()) / (np_array.max() - np_array.min())
-                
-                # Convert to uint8 format
-                np_array = (np_array * 255).astype(np.uint8)
-                
-                # Convert to PIL image
-                if np_array.shape[0] == 1:
-                    np_array = np_array.squeeze(0)  # If single channel, remove channel dimension
-                    image = Image.fromarray(np_array, mode='L')  # 'L' for (8-bit pixels, black and white)
-                else:
-                    np_array = np_array.transpose(1, 2, 0)  # Convert from (C, H, W) to (H, W, C)
-                    image = Image.fromarray(np_array)
-                
-                return image
-
-            image = tensor_to_image(org_image)
-            annotation_image = tensor_to_image(image2)
-            plt.figure(figsize=(10, 5))
-
-            plt.subplot(1, 2, 1)
-            plt.title("Image")
-            plt.imshow(image)
-            plt.axis('off')
-
-            plt.subplot(1, 2, 2)
-            plt.title("Annotation Image")
-            plt.imshow(annotation_image)
-            plt.axis('off')
-
-            plt.show()
-            """
 
         return image, annotation_int
 
@@ -223,7 +248,7 @@ if __name__ == '__main__':
     epochs = 10
     for e in range(epochs):
         total_loss = 0.0
-        for xx, yy in dataloader:
+        for xx, yy in tqdm.tqdm(dataloader):
             y_pred = model(xx)
             loss = model.loss(y_pred, yy)
 

@@ -86,6 +86,39 @@ class SingletonFFTransformer(FFTransformer):
         val = torch.ones((*manifold_size, 1), device=device)
         super().__init__(key, val)
 
+class R2BilinearFFTransformer(FFTransformer):
+    def __init__(self, dim, kdim):
+        # might want to make more efficient in the future
+        assert dim % (kdim - 1) == 0
+
+        blend_key = torch.zeros((dim, dim, 2 ** 2), dtype=torch.int).to(device)
+        blend_val = torch.zeros((dim, dim, 2 ** 2)).to(device)
+
+        block = dim // (kdim - 1)
+
+        for (x, y) in itertools.product(range(dim), repeat=4):
+            xind = x // block
+            yind = y // block
+
+            xs = x % block / block 
+            ys = y % block / block 
+            s = (xs, ys) 
+
+            for i, vertex in enumerate(itertools.product([0, 1], repeat=2)):
+                xp = xind + vertex[0]
+                yp = yind + vertex[1]
+                prod = 1
+                for i in range(2):
+                    if vertex[i] == 0:
+                        prod *= (1 - s[i])
+                    else:
+                        prod *= s[i]
+                
+                blend_key[x,y,i] = xp * kdim + yp 
+                blend_val[x,y,i] = prod
+
+        super().__init__(blend_key, blend_val)
+        
 class R4BilinearFFTransformer(FFTransformer):
     def __init__(self, dim, kdim):
         # might want to make more efficient in the future
