@@ -16,49 +16,48 @@ from group_basis import GroupBasis
 from ff_transformer import TorusFFTransformer
 from config import Config
 
-device = get_device(no_mps=False)
+device = get_device()
 
 _lerp = None
 def lerp():
     global _lerp
     if _lerp is None:
-        _lerp = TorusFFTransformer(20, 20, 2, 2)  
+        _lerp = TorusFFTransformer(20, 20, 4, 4)  
     return _lerp
 
 def perform_flow(features, flow, steps=1, delta=1):
     # features: [bs, channels, r, c]
-    inverse = flow * delta / steps
+    inverse = -flow * delta / steps
     r = features.shape[2]
     c = features.shape[3]
 
     index_map = torch.zeros_like(flow)
-    index_map[torch.arange(r), :, 0] = torch.arange(r, dtype=torch.float32).view(r, 1).to(device)
-    index_map[:, torch.arange(c), 1] = torch.arange(c, dtype=torch.float32).view(1, c).to(device)
+    index_map[torch.arange(r), :, 0] = torch.arange(r, dtype=flow.dtype).view(r, 1).to(device)
+    index_map[:, torch.arange(c), 1] = torch.arange(c, dtype=flow.dtype).view(1, c).to(device)
     index_map += inverse
 
-    u_map = torch.zeros_like(index_map)
+    u_map = torch.zeros_like(index_map).long()
     u_map[..., 0] = 1
-    v_map = torch.zeros_like(index_map)
+    v_map = torch.zeros_like(index_map).long()
     v_map[..., 1] = 1
 
-
-    base_00 = torch.round(index_map).long()
+    base_00 = torch.floor(index_map).long()
     base_01 = base_00 + u_map
     base_10 = base_00 + v_map
     base_11 = base_00 + u_map + v_map
 
-    st = index_map - torch.floor(index_map) 
-    s = st[..., 0]
-    t = st[..., 1]
+    st = index_map - torch.floor(index_map)
+    s = st[..., 0].detach()
+    t = st[..., 1].detach()
 
     def step(curr):
+        x_padded = F.pad(curr, (1, 1, 1, 1), mode='constant', value=0) 
         def factor(tensor, mul):
-            clipped_x = tensor[..., 0].clip(0, r - 1).long()
-            clipped_y = tensor[..., 1].clip(0, c - 1).long()
-            return curr[..., clipped_x, clipped_y] * mul
+            clipped_x = tensor[..., 0].clip(0, r)
+            clipped_y = tensor[..., 1].clip(0, c)
+            return x_padded[..., clipped_x + 1, clipped_y + 1] * mul
        
-        return factor(base_00, 1)
-        # return factor(base_00, s * t) + factor(base_01, s * (1 - t)) + factor(base_10, (1 - s) * t) + factor(base_11, (1 - s) * (1 - t))
+        return factor(base_00, (1 - s) * (1 - t)) + factor(base_01, s * (1 - t)) + factor(base_10, s * (1 - t)) + factor(base_11, s * t)
 
     for _ in range(steps):
         features = step(features)
@@ -76,6 +75,27 @@ class Flow(nn.Module):
 
         # self.main_flow = nn.Parameter(torch.empty(num_flows, 100, 2))
         # torch.nn.init.normal_(self.main_flow, 0, 0.02)
+        self.main_flow = torch.empty((num_flows, 16, 2), dtype=torch.double, device=device)
+        for i in range(4):
+            for j in range(4):
+                dx = i - 1.5
+                dy = j - 1.5
+                self.main_flow[:, 4 * i + j] = torch.tensor(
+                    [
+                        [-dx, -dy],
+                        [-dx, 0],
+                        [-dx, dy],
+
+                        [0, -dy],
+                        [0, 0],
+                        [0, dy],
+            
+                        [dx, -dy],
+                        [dx, 0],
+                        [dx, dy],
+                    ],
+                dtype=torch.double, device=device)
+        """
         self.main_flow = torch.tensor([
               [[-1, -1]],
               [[-1, 0]],
@@ -88,10 +108,11 @@ class Flow(nn.Module):
               [[1, -1]],
               [[1, 0]],
               [[1, 1]],
-        ], device=device).expand((num_flows, 4, 2))
+        ], device=device).expand((num_flows, 16, 2)).double()
+        """
 
-        self.combinator = nn.Parameter(torch.empty(output_features, input_features * num_flows, device=device))
-        self.bias = nn.Parameter(torch.empty(output_features, device=device))
+        self.combinator = nn.Parameter(torch.empty(output_features, input_features * num_flows, device=device).double())
+        self.bias = nn.Parameter(torch.empty(output_features, device=device).double())
 
         # same as conv initialization
         n = input_features * num_flows
@@ -109,17 +130,19 @@ class Flow(nn.Module):
     def forward(self, x):
         flow = lerp().smooth_function(self.main_flow)
 
-        ret = torch.empty((self.num_flows, x.shape[0], self.input_features, 20, 20)).to(x.device)
+        ret = torch.empty((self.num_flows, x.shape[0], self.input_features, 20, 20)).double().to(x.device)
         x_padded = F.pad(x, (1, 1, 1, 1), mode='constant', value=0) 
         for i in range(self.num_flows):
-            dy, dx = self.main_flow[i][0]
-            ret[i] = x_padded[:, :, 1+dy:21+dy, 1+dx:21+dx]
-            # ret[i] = perform_flow(x, flow[i])
+            # dy, dx = self.main_flow[i][0]
+            # ret[i] = x_padded[:, :, 1+dy:21+dy, 1+dx:21+dx]
+            ret[i] = perform_flow(x, -flow[i])
 
-        ret = ret.permute(1, 3, 4, 0, 2).reshape(x.shape[0], 20, 20, self.input_features * self.num_flows, 1)
+        ret = ret.permute(1, 3, 4, 2, 0).reshape(x.shape[0], 20, 20, self.input_features * self.num_flows, 1)
         ret = (self.combinator @ ret).squeeze(-1) + self.bias
         ret = ret.permute(0, 3, 1, 2)
+
         comp = self.c(x)
+
         return ret
     
 class CloudPredictor(nn.Module):
@@ -165,8 +188,8 @@ class CloudDataset(torch.utils.data.Dataset):
     def __init__(self, N):
         super().__init__()
 
-        self.x = torch.randn((N, 3, 20, 20), device=device)
-        self.y = self.x
+        self.x = torch.randn((N, 3, 20, 20), device=device).double()
+        self.y = 1 - self.x
 
     def __len__(self):
         return len(self.x)

@@ -107,7 +107,7 @@ class Flow(nn.Module):
         self.c.bias = self.bias
          
     def forward(self, x):
-        flow = lerp().smooth_function(self.main_flow)
+        # flow = lerp().smooth_function(self.main_flow)
         # ret = perform_flow(x, flow)
 
         # Instead of using torch.roll, let's create a padded version of x
@@ -115,15 +115,15 @@ class Flow(nn.Module):
 
         ret = torch.empty((self.num_flows, x.shape[0], self.input_features, 450, 480)).to(x.device)
         for i in range(self.num_flows):
-            # dy, dx = self.main_flow[i][0]
-            # ret[i] = x_padded[:, :, 1+dy:451+dy, 1+dx:481+dx]
-            ret[i] = perform_flow(x, flow[i])
+            dy, dx = self.main_flow[i][0]
+            ret[i] = x_padded[:, :, 1+dy:451+dy, 1+dx:481+dx]
+            # ret[i] = perform_flow(x, flow[i])
 
         ret = ret.permute(1, 3, 4, 0, 2).reshape(x.shape[0], 450, 480, self.input_features * self.num_flows, 1)
         ret = (self.combinator @ ret).squeeze(-1) + self.bias
         ret = ret.permute(0, 3, 1, 2)
         comp = self.c(x)
-        print(rmse(ret, comp))
+
         return ret
 
         if self.training and not self.bad:
